@@ -6,7 +6,7 @@ from typing import List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from pdf2image import convert_from_bytes
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 
 ACCEPTED_CONTENT_TYPES = {
     "application/pdf",
@@ -20,6 +20,42 @@ BASE_STORAGE_DIR = Path("storage") / "ingested"
 
 def ensure_storage_dir() -> None:
     BASE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def preprocess_image(img: Image.Image) -> Image.Image:
+    """
+    Apply light-weight preprocessing to improve OCR robustness:
+    - Normalize orientation (ensure portrait-style height >= width when close).
+    - Convert to grayscale.
+    - Auto-contrast to stretch histogram.
+    - Mild sharpening.
+    - Mild upscaling for very small images.
+
+    Note: Sharpening and upscaling are intentionally conservative so they
+    can help OCR on slightly soft scans without aggressively amplifying blur.
+    """
+    # Ensure portrait orientation when width and height are close.
+    width, height = img.size
+    if width > height * 1.1:
+        img = img.rotate(90, expand=True)
+
+    # Convert to grayscale.
+    img = img.convert("L")
+
+    # Auto-contrast to enhance text/background separation.
+    img = ImageOps.autocontrast(img, cutoff=2)
+
+    # Mild sharpening to crisp up edges.
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=75, threshold=5))
+
+    # Mild upscaling for very low-resolution images.
+    min_dim = min(img.size)
+    if min_dim < 800:
+        scale = 800 / float(min_dim)
+        new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
+        img = img.resize(new_size, Image.BICUBIC)
+
+    return img
 
 
 app = FastAPI(title="Zero-Error Invoice Extraction - Ingestion")
@@ -216,15 +252,16 @@ async def ingest_documents(
             # Convert each PDF page to a PNG image.
             pages = convert_from_bytes(content, fmt="png")
             for index, page in enumerate(pages, start=1):
+                page = preprocess_image(page)
                 image_path = invoice_dir / f"page-{index}.png"
                 page.save(image_path, format="PNG")
                 page_image_paths.append(str(image_path))
         else:
             # Normalize images to PNG.
             with Image.open(io.BytesIO(content)) as img:
-                rgb_img = img.convert("RGB")
+                processed = preprocess_image(img)
                 image_path = invoice_dir / "page-1.png"
-                rgb_img.save(image_path, format="PNG")
+                processed.save(image_path, format="PNG")
                 page_image_paths.append(str(image_path))
 
         ingested_files.append(
