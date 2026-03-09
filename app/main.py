@@ -1,9 +1,12 @@
 from pathlib import Path
+import io
 import uuid
 from typing import List
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
+from pdf2image import convert_from_bytes
+from PIL import Image
 
 ACCEPTED_CONTENT_TYPES = {
     "application/pdf",
@@ -187,7 +190,7 @@ async def ingest_documents(
 
     ensure_storage_dir()
 
-    ingested_files = []
+    ingested_files: List[dict] = []
 
     for upload in files:
         if upload.content_type not in ACCEPTED_CONTENT_TYPES:
@@ -197,30 +200,38 @@ async def ingest_documents(
                 f"Accepted types: {sorted(ACCEPTED_CONTENT_TYPES)}",
             )
 
-        invoice_id = str(uuid.uuid4())
-        invoice_dir = BASE_STORAGE_DIR / invoice_id
-        invoice_dir.mkdir(parents=True, exist_ok=True)
-
-        extension = Path(upload.filename or "").suffix or _extension_from_content_type(
-            upload.content_type
-        )
-        stored_filename = f"page-1{extension}"
-        dest_path = invoice_dir / stored_filename
-
         content = await upload.read()
         if not content:
             raise HTTPException(
                 status_code=400, detail=f"File {upload.filename} is empty."
             )
 
-        dest_path.write_bytes(content)
+        invoice_id = str(uuid.uuid4())
+        invoice_dir = BASE_STORAGE_DIR / invoice_id
+        invoice_dir.mkdir(parents=True, exist_ok=True)
+
+        page_image_paths: List[str] = []
+
+        if upload.content_type == "application/pdf":
+            # Convert each PDF page to a PNG image.
+            pages = convert_from_bytes(content, fmt="png")
+            for index, page in enumerate(pages, start=1):
+                image_path = invoice_dir / f"page-{index}.png"
+                page.save(image_path, format="PNG")
+                page_image_paths.append(str(image_path))
+        else:
+            # Normalize images to PNG.
+            with Image.open(io.BytesIO(content)) as img:
+                rgb_img = img.convert("RGB")
+                image_path = invoice_dir / "page-1.png"
+                rgb_img.save(image_path, format="PNG")
+                page_image_paths.append(str(image_path))
 
         ingested_files.append(
             {
                 "invoice_id": invoice_id,
                 "original_filename": upload.filename,
-                "stored_path": str(dest_path),
-                "content_type": upload.content_type,
+                "page_images": page_image_paths,
             }
         )
 

@@ -21,12 +21,18 @@ This is the first step of the Zero-Error Invoice Data Extraction pipeline. It is
     - `files`: list of ingested file descriptors:
       - `invoice_id`: UUID assigned per uploaded file (used as directory name).
       - `original_filename`
-      - `stored_path`: relative path on disk for downstream stages.
-      - `content_type`
+      - `page_images`: list of normalized image paths (one per page).
 
 ### Storage Layout
 
-Files are stored under `storage/ingested/<invoice_id>/page-1.<ext>`.
+Every uploaded document is normalized to **PNG images**:
 
-Later stages (OCR, layout analysis) will use the `invoice_id` and stored path to load the original binary content and generate OCR outputs.
+- For PDFs: each page is rendered as an image and stored as:
+  - `storage/ingested/<invoice_id>/page-1.png`
+  - `storage/ingested/<invoice_id>/page-2.png`
+  - ...
+- For images: the original is re-encoded to PNG and stored as:
+  - `storage/ingested/<invoice_id>/page-1.png`
+
+Later stages (OCR, layout analysis) will use `invoice_id` and `page_images` to load the normalized page images and generate OCR outputs.
 
