@@ -1,12 +1,20 @@
 from pathlib import Path
 import io
+import os
 import uuid
-from typing import List
+import re
+import json
+from typing import Dict, List, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from pdf2image import convert_from_bytes
 from PIL import Image, ImageOps, ImageFilter
+import pytesseract
+from pytesseract import Output
+from pydantic import BaseModel
+import google.generativeai as genai
+from dotenv import load_dotenv
 
 ACCEPTED_CONTENT_TYPES = {
     "application/pdf",
@@ -17,6 +25,9 @@ ACCEPTED_CONTENT_TYPES = {
 
 BASE_STORAGE_DIR = Path("storage") / "ingested"
 
+# Load environment variables from .env if present.
+load_dotenv()
+
 
 def ensure_storage_dir() -> None:
     BASE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -25,8 +36,7 @@ def ensure_storage_dir() -> None:
 def preprocess_image(img: Image.Image) -> Image.Image:
     """
     Apply light-weight preprocessing to improve OCR robustness:
-    - Normalize orientation (ensure portrait-style height >= width when close).
-    - Convert to grayscale.
+    - Convert to grayscale (no forced rotation).
     - Auto-contrast to stretch histogram.
     - Mild sharpening.
     - Mild upscaling for very small images.
@@ -34,11 +44,6 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     Note: Sharpening and upscaling are intentionally conservative so they
     can help OCR on slightly soft scans without aggressively amplifying blur.
     """
-    # Ensure portrait orientation when width and height are close.
-    width, height = img.size
-    if width > height * 1.1:
-        img = img.rotate(90, expand=True)
-
     # Convert to grayscale.
     img = img.convert("L")
 
@@ -49,7 +54,8 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     img = img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=75, threshold=5))
 
     # Mild upscaling for very low-resolution images.
-    min_dim = min(img.size)
+    width, height = img.size
+    min_dim = min(width, height)
     if min_dim < 800:
         scale = 800 / float(min_dim)
         new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
@@ -59,6 +65,107 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
 
 app = FastAPI(title="Zero-Error Invoice Extraction - Ingestion")
+
+
+def get_gemini_model() -> genai.GenerativeModel:
+    """
+    Lazily configure and return a Gemini GenerativeModel instance using
+    GEMINI_API_KEY and GEMINI_MODEL from the environment.
+    """
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "Missing Gemini API key. Set GEMINI_API_KEY in .env "
+            "(or GOOGLE_API_KEY as fallback)."
+        )
+    genai.configure(api_key=api_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-3-flash")
+    return genai.GenerativeModel(model_name)
+
+
+def _parse_llm_json(raw_text: str) -> dict:
+    """
+    Parse JSON from model output robustly.
+    Gemini may return plain JSON or JSON wrapped in markdown fences.
+    """
+    import json
+
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("Empty model response")
+
+    # Direct parse first.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Try fenced json block: ```json ... ``` or ``` ... ```
+    fence_match = re.search(r"```(?:json)?\s*(\{[\s\S]*\})\s*```", text)
+    if fence_match:
+        return json.loads(fence_match.group(1))
+
+    # Last fallback: first JSON object-like block.
+    obj_match = re.search(r"(\{[\s\S]*\})", text)
+    if obj_match:
+        return json.loads(obj_match.group(1))
+
+    raise ValueError("No valid JSON object found in model response")
+
+
+class OcrToken(BaseModel):
+    text: str
+    bbox: Tuple[float, float, float, float]
+    confidence: float
+    line_id: str
+    block_id: str
+
+
+class OcrLine(BaseModel):
+    id: str
+    tokens: List[OcrToken]
+    bbox: Tuple[float, float, float, float]
+    reading_order_index: int
+
+
+class OcrPage(BaseModel):
+    page_number: int
+    width: int
+    height: int
+    lines: List[OcrLine]
+
+
+class InvoiceLineItem(BaseModel):
+    description: str
+    quantity: float | None
+    unit_price: float | None
+    line_total: float | None
+    discount: float | None = None
+    extra_cost: float | None = None
+    source_line_ids: List[str]
+
+
+class InvoiceSummary(BaseModel):
+    subtotal: float | None
+    total: float | None
+    currency: str | None = None
+    tax_bases: List[float] | None = None
+    tax_rates: List[float] | None = None
+
+
+class InvoiceMetadata(BaseModel):
+    invoice_number: str | None = None
+    invoice_date: str | None = None
+    vendor_name: str | None = None
+    customer_name: str | None = None
+
+
+class InvoiceExtraction(BaseModel):
+    invoice_id: str
+    line_items: List[InvoiceLineItem]
+    summary: InvoiceSummary
+    metadata: InvoiceMetadata
+    raw_model_output: dict
 
 
 @app.on_event("startup")
@@ -272,6 +379,18 @@ async def ingest_documents(
             }
         )
 
+        # Automatically run extraction right after ingestion so each new
+        # invoice folder gets extraction output files without a second API call.
+        extraction_error = None
+        try:
+            extraction, raw = await _run_extraction_pipeline(invoice_id)
+            _persist_extraction_files(invoice_id, extraction, raw)
+            ingested_files[-1]["extraction_created"] = True
+        except Exception as exc:
+            extraction_error = str(exc)
+            ingested_files[-1]["extraction_created"] = False
+            ingested_files[-1]["extraction_error"] = extraction_error
+
     return JSONResponse({"status": "ok", "files": ingested_files})
 
 
@@ -283,4 +402,275 @@ def _extension_from_content_type(content_type: str) -> str:
     if content_type in {"image/jpeg", "image/jpg"}:
         return ".jpg"
     return ""
+
+
+@app.get("/ocr/{invoice_id}")
+async def run_ocr(invoice_id: str) -> JSONResponse:
+    """
+    HTTP wrapper that runs OCR on normalized page images and returns
+    a layout-preserving representation (tokens grouped into lines with bboxes).
+    """
+    pages = await _perform_ocr(invoice_id)
+    return JSONResponse({"invoice_id": invoice_id, "pages": [p.model_dump() for p in pages]})
+
+
+async def _perform_ocr(invoice_id: str) -> List[OcrPage]:
+    """
+    Run OCR on all normalized page images for the given invoice and return
+    layout-preserving pages (tokens grouped into lines with bboxes).
+    """
+    invoice_dir = BASE_STORAGE_DIR / invoice_id
+    if not invoice_dir.exists() or not invoice_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Invoice not found.")
+
+    page_files = sorted(invoice_dir.glob("page-*.png"))
+    if not page_files:
+        raise HTTPException(status_code=400, detail="No page images for invoice.")
+
+    pages: List[OcrPage] = []
+
+    for page_index, image_path in enumerate(page_files, start=1):
+        with Image.open(image_path) as img:
+            width, height = img.size
+
+            data = pytesseract.image_to_data(
+                img,
+                output_type=Output.DICT,
+                config="--psm 6",  # assume a uniform block of text with some structure
+            )
+
+            lines_map: Dict[Tuple[int, int], List[OcrToken]] = {}
+
+            n = len(data["text"])
+            for i in range(n):
+                text = data["text"][i].strip()
+                conf_str = data["conf"][i]
+                try:
+                    conf = float(conf_str)
+                except ValueError:
+                    conf = -1.0
+
+                if not text or conf < 0:
+                    continue
+
+                left = data["left"][i]
+                top = data["top"][i]
+                w = data["width"][i]
+                h = data["height"][i]
+
+                # Normalize to 0–1 coordinates.
+                x_min = left / width
+                y_min = top / height
+                x_max = (left + w) / width
+                y_max = (top + h) / height
+
+                block_num = data["block_num"][i]
+                line_num = data["line_num"][i]
+                line_key = (block_num, line_num)
+                line_id = f"p{page_index}_b{block_num}_l{line_num}"
+                block_id = f"p{page_index}_b{block_num}"
+
+                token = OcrToken(
+                    text=text,
+                    bbox=(x_min, y_min, x_max, y_max),
+                    confidence=conf,
+                    line_id=line_id,
+                    block_id=block_id,
+                )
+                lines_map.setdefault(line_key, []).append(token)
+
+            # Build OcrLine objects in reading order: block_num, then line_num, then x.
+            ocr_lines: List[OcrLine] = []
+            sorted_keys = sorted(lines_map.keys(), key=lambda k: (k[0], k[1]))
+            for order_index, key in enumerate(sorted_keys):
+                tokens = sorted(
+                    lines_map[key], key=lambda t: t.bbox[0]
+                )  # sort left-to-right
+
+                # Derive line bbox from token bboxes.
+                x_mins = [t.bbox[0] for t in tokens]
+                y_mins = [t.bbox[1] for t in tokens]
+                x_maxs = [t.bbox[2] for t in tokens]
+                y_maxs = [t.bbox[3] for t in tokens]
+
+                line_bbox = (
+                    min(x_mins),
+                    min(y_mins),
+                    max(x_maxs),
+                    max(y_maxs),
+                )
+
+                line_id = tokens[0].line_id
+                ocr_lines.append(
+                    OcrLine(
+                        id=line_id,
+                        tokens=tokens,
+                        bbox=line_bbox,
+                        reading_order_index=order_index,
+                    )
+                )
+
+            pages.append(
+                OcrPage(
+                    page_number=page_index,
+                    width=width,
+                    height=height,
+                    lines=ocr_lines,
+                )
+            )
+
+    return pages
+
+
+def _build_llm_extraction_prompt(invoice_id: str, pages: List[OcrPage]) -> str:
+    """
+    Build a compact, layout-aware prompt from OCR pages to drive the LLM extraction.
+    """
+    lines_text: List[str] = []
+    for page in pages:
+        for line in sorted(page.lines, key=lambda l: l.reading_order_index):
+            text = " ".join(token.text for token in line.tokens)
+            if not text.strip():
+                continue
+            lines_text.append(f"[page={page.page_number} line_id={line.id}] {text}")
+
+    joined_lines = "\n".join(lines_text[:800])
+
+    schema_description = """
+Return a JSON object with the following structure and NO additional commentary:
+{
+  "line_items": [
+    {
+      "description": string,
+      "quantity": number | null,
+      "unit_price": number | null,
+      "line_total": number | null,
+      "discount": number | null,
+      "extra_cost": number | null,
+      "source_line_ids": [string, ...]
+    }
+  ],
+  "summary": {
+    "subtotal": number | null,
+    "total": number | null,
+    "currency": string | null,
+    "tax_bases": [number, ...] | null,
+    "tax_rates": [number, ...] | null
+  },
+  "metadata": {
+    "invoice_number": string | null,
+    "invoice_date": string | null,
+    "vendor_name": string | null,
+    "customer_name": string | null
+  }
+}
+If any value is missing or ambiguous in the text, set it explicitly to null. Do NOT invent values.
+"""
+
+    instructions = f"""
+You are given OCR-extracted lines from one invoice, with page numbers and stable line_ids.
+Your task is to:
+- Identify line items (product/service rows) and map them to the fields in the schema.
+- Identify summary fields (subtotal, tax bases + rates, total).
+- Identify invoice-level metadata (invoice number, date, vendor, customer).
+- For each numeric field, only use numbers that appear in the text.
+- For each line item, fill source_line_ids with the line_id(s) the row came from.
+- If something is unclear or not present, use null for that field instead of guessing.
+
+INVOICE_ID={invoice_id}
+
+OCR LINES (in reading order):
+{joined_lines}
+
+{schema_description}
+"""
+    return instructions.strip()
+
+
+async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, str]:
+    """
+    End-to-end extraction pipeline:
+    OCR -> prompt build -> Gemini call -> JSON parse -> typed mapping.
+    Returns (typed_extraction, raw_model_text).
+    """
+    pages = await _perform_ocr(invoice_id)
+    prompt = _build_llm_extraction_prompt(invoice_id, pages)
+    model = get_gemini_model()
+
+    try:
+        completion = model.generate_content(prompt)
+    except Exception as exc:
+        raise RuntimeError(f"LLM extraction failed: {exc}") from exc
+
+    raw = completion.text or ""
+
+    try:
+        parsed = _parse_llm_json(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM did not return valid JSON. Raw output starts with: {raw[:200]!r}"
+        ) from exc
+
+    extraction = InvoiceExtraction(
+        invoice_id=invoice_id,
+        line_items=[
+            InvoiceLineItem(
+                description=item.get("description", "") or "",
+                quantity=item.get("quantity"),
+                unit_price=item.get("unit_price"),
+                line_total=item.get("line_total"),
+                discount=item.get("discount"),
+                extra_cost=item.get("extra_cost"),
+                source_line_ids=item.get("source_line_ids") or [],
+            )
+            for item in parsed.get("line_items", []) or []
+        ],
+        summary=InvoiceSummary(
+            subtotal=parsed.get("summary", {}).get("subtotal"),
+            total=parsed.get("summary", {}).get("total"),
+            currency=parsed.get("summary", {}).get("currency"),
+            tax_bases=parsed.get("summary", {}).get("tax_bases"),
+            tax_rates=parsed.get("summary", {}).get("tax_rates"),
+        ),
+        metadata=InvoiceMetadata(
+            invoice_number=parsed.get("metadata", {}).get("invoice_number"),
+            invoice_date=parsed.get("metadata", {}).get("invoice_date"),
+            vendor_name=parsed.get("metadata", {}).get("vendor_name"),
+            customer_name=parsed.get("metadata", {}).get("customer_name"),
+        ),
+        raw_model_output=parsed,
+    )
+
+    return extraction, raw
+
+
+def _persist_extraction_files(invoice_id: str, extraction: InvoiceExtraction, raw: str) -> None:
+    """
+    Persist parsed extraction and raw model output beside page images.
+    """
+    invoice_dir = BASE_STORAGE_DIR / invoice_id
+    invoice_dir.mkdir(parents=True, exist_ok=True)
+    result_path = invoice_dir / "extraction.json"
+    raw_path = invoice_dir / "extraction_raw.txt"
+    result_path.write_text(
+        json.dumps(extraction.model_dump(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    raw_path.write_text(raw, encoding="utf-8")
+
+
+@app.get("/extract/{invoice_id}")
+async def extract_invoice(invoice_id: str) -> JSONResponse:
+    """
+    Run OCR for the invoice, then use an LLM to propose a structured extraction
+    following the InvoiceExtraction schema. This is an initial extraction only;
+    further zero-hallucination validation happens in downstream steps.
+    """
+    try:
+        extraction, raw = await _run_extraction_pipeline(invoice_id)
+        _persist_extraction_files(invoice_id, extraction, raw)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return JSONResponse(extraction.model_dump())
 
