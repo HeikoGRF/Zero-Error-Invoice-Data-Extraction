@@ -8,6 +8,9 @@ env/
 venv/
 ENV/
 .venv/
+.env
+.env.*
+!.env.example
 
 # IDE / Editor
 .vscode/
