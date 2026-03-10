@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 from pathlib import Path
 import io
 import os
 import uuid
 import re
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Literal
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -113,6 +115,61 @@ def _parse_llm_json(raw_text: str) -> dict:
     raise ValueError("No valid JSON object found in model response")
 
 
+def _collect_ocr_numbers_by_line(pages: List[OcrPage]) -> Dict[str, List[str]]:
+    """
+    Build a mapping line_id -> list of numeric-looking token substrings.
+    Used to verify that extracted numeric values actually appear in OCR text.
+    """
+    line_numbers: Dict[str, List[str]] = {}
+    number_pattern = re.compile(r"[0-9][0-9.,]*")
+
+    for page in pages:
+        for line in page.lines:
+            bucket = line_numbers.setdefault(line.id, [])
+            for token in line.tokens:
+                for match in number_pattern.findall(token.text):
+                    bucket.append(match)
+
+    return line_numbers
+
+
+def _value_appears_in_ocr(
+    value: float | int,
+    source_line_ids: List[str],
+    ocr_numbers_by_line: Dict[str, List[str]],
+) -> bool:
+    """
+    Check if a numeric value occurs in the OCR text for the given lines
+    (with simple normalization of decimal separators and formatting).
+    """
+    if not source_line_ids:
+        return False
+
+    # Generate a few common string representations.
+    candidates: List[str] = []
+    try:
+        candidates.append(str(int(value)))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        candidates.append(f"{float(value):.2f}")
+    except (TypeError, ValueError):
+        pass
+
+    normalized_candidates = set(c.replace(",", ".") for c in candidates if c)
+
+    for line_id in source_line_ids:
+        numbers = ocr_numbers_by_line.get(line_id) or []
+        for num in numbers:
+            norm = num.replace(",", ".")
+            for cand in normalized_candidates:
+                if cand and cand in norm:
+                    return True
+
+    return False
+
+
 class OcrToken(BaseModel):
     text: str
     bbox: Tuple[float, float, float, float]
@@ -166,6 +223,22 @@ class InvoiceExtraction(BaseModel):
     summary: InvoiceSummary
     metadata: InvoiceMetadata
     raw_model_output: dict
+    validation: "InvoiceValidation | None" = None
+
+
+class ValidationIssue(BaseModel):
+    level: Literal["warning", "error"]
+    code: str
+    message: str
+    path: str | None = None
+
+
+class InvoiceValidation(BaseModel):
+    status: Literal["ok", "partial", "failed"]
+    issues: List[ValidationIssue]
+
+
+InvoiceExtraction.model_rebuild()
 
 
 @app.on_event("startup")
@@ -641,6 +714,10 @@ async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, 
         raw_model_output=parsed,
     )
 
+    # Run zero-hallucination validation on top of the extraction.
+    ocr_numbers_by_line = _collect_ocr_numbers_by_line(pages)
+    extraction.validation = _validate_extraction(invoice_id, extraction, ocr_numbers_by_line)
+
     return extraction, raw
 
 
@@ -657,6 +734,116 @@ def _persist_extraction_files(invoice_id: str, extraction: InvoiceExtraction, ra
         encoding="utf-8",
     )
     raw_path.write_text(raw, encoding="utf-8")
+
+
+def _validate_extraction(
+    invoice_id: str,
+    extraction: InvoiceExtraction,
+    ocr_numbers_by_line: Dict[str, List[str]],
+) -> InvoiceValidation:
+    """
+    Zero-hallucination validation:
+    - Ensure numeric fields appear in OCR text near their source_line_ids.
+    - Check line-item arithmetic consistency.
+    - Check subtotal/total consistency.
+    """
+    issues: List[ValidationIssue] = []
+    tol = 0.01
+
+    # Line-item checks.
+    for idx, item in enumerate(extraction.line_items):
+        path_prefix = f"line_items[{idx}]"
+
+        # Provenance checks: quantity, unit_price, line_total, discount, extra_cost.
+        for field_name in ("quantity", "unit_price", "line_total", "discount", "extra_cost"):
+            value = getattr(item, field_name)
+            if value is None:
+                continue
+            if not _value_appears_in_ocr(value, item.source_line_ids, ocr_numbers_by_line):
+                issues.append(
+                    ValidationIssue(
+                        level="error",
+                        code="value_not_in_ocr",
+                        message=f"{field_name}={value!r} does not appear in OCR text near its source_line_ids",
+                        path=f"{path_prefix}.{field_name}",
+                    )
+                )
+
+        # Arithmetic check for line_total.
+        if item.quantity is not None and item.unit_price is not None and item.line_total is not None:
+            discount = item.discount or 0.0
+            extra_cost = item.extra_cost or 0.0
+            expected = item.quantity * item.unit_price - discount + extra_cost
+            if abs(expected - item.line_total) > tol:
+                issues.append(
+                    ValidationIssue(
+                        level="error",
+                        code="line_total_mismatch",
+                        message=(
+                            f"Computed line_total {expected:.2f} from quantity, unit_price, "
+                            f"discount, extra_cost does not match extracted {item.line_total:.2f}."
+                        ),
+                        path=f"{path_prefix}.line_total",
+                    )
+                )
+
+    # Summary subtotal vs sum of line totals.
+    if extraction.summary.subtotal is not None:
+        sum_lines = sum(
+            item.line_total for item in extraction.line_items if item.line_total is not None
+        )
+        if abs(sum_lines - extraction.summary.subtotal) > tol:
+            issues.append(
+                ValidationIssue(
+                    level="error",
+                    code="subtotal_mismatch",
+                    message=(
+                        f"Sum of line item totals {sum_lines:.2f} does not match extracted "
+                        f"subtotal {extraction.summary.subtotal:.2f}."
+                    ),
+                    path="summary.subtotal",
+                )
+            )
+
+    # Total vs subtotal + tax.
+    if (
+        extraction.summary.total is not None
+        and extraction.summary.subtotal is not None
+        and extraction.summary.tax_bases
+        and extraction.summary.tax_rates
+        and len(extraction.summary.tax_bases) == len(extraction.summary.tax_rates)
+    ):
+        computed_tax = 0.0
+        for base, rate in zip(extraction.summary.tax_bases, extraction.summary.tax_rates):
+            if base is None or rate is None:
+                continue
+            computed_tax += float(base) * float(rate) / 100.0
+
+        expected_total = extraction.summary.subtotal + computed_tax
+        if abs(expected_total - extraction.summary.total) > tol:
+            issues.append(
+                ValidationIssue(
+                    level="error",
+                    code="total_mismatch",
+                    message=(
+                        f"Subtotal + computed tax ({expected_total:.2f}) does not match extracted "
+                        f"total {extraction.summary.total:.2f}."
+                    ),
+                    path="summary.total",
+                )
+            )
+
+    # Determine overall status.
+    has_error = any(i.level == "error" for i in issues)
+    status: Literal["ok", "partial", "failed"]
+    if has_error:
+        status = "failed"
+    elif issues:
+        status = "partial"
+    else:
+        status = "ok"
+
+    return InvoiceValidation(status=status, issues=issues)
 
 
 @app.get("/extract/{invoice_id}")
