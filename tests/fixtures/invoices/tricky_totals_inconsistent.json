@@ -3,6 +3,7 @@
   "ocr_lines": [
     "ACME Supplies GmbH",
     "Invoice Number: INV-2025-9001",
+    "Invoice Date: 2025-11-10",
     "Bill To:",
     "TalkyLabs AG",
     "Service X 2 100.00 EUR 0.00 EUR 200.00 EUR",
@@ -56,8 +57,13 @@
     "metadata": {
       "invoice_number": "INV-2025-9001",
       "invoice_date": "2025-11-10",
+      "due_date": null,
+      "purchase_order_number": null,
+      "currency": null,
       "vendor_name": "ACME Supplies GmbH",
-      "customer_name": "TalkyLabs AG"
+      "vendor_details": null,
+      "customer_name": "TalkyLabs AG",
+      "customer_details": null
     },
     "raw_model_output": {}
   },

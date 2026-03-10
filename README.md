@@ -55,7 +55,8 @@ The page lets you:
 - It normalizes them to images, runs OCR, LLM extraction, validation, and shows:
   - extraction/validation status per file,
   - OCR quality metrics (avg confidence, low-confidence ratio),
-  - counts of validation errors/warnings.
+  - counts of validation errors/warnings,
+  - raw model output in a scrollable window for debugging.
 
 The structured output for each invoice is also written to disk:
 
@@ -83,6 +84,17 @@ Covered fixture set:
 ## Solution description for the Zero-Error Invoice Extraction challenge
 
 The goal of this repository is to implement a robust, end-to-end pipeline for extracting structured invoice data with a near-zero silent failure rate, as described in the technical challenge PDF. Below is how the current implementation addresses each part of the challenge.
+
+### Framing: what "zero-error" means in this implementation
+
+The challenge asks for a system with a "zero-percent failure rate", but in practice the critical requirement is to avoid **silent failures**. The current solution is therefore designed around the following principle:
+
+- the system may return `null` for uncertain fields,
+- it may mark an invoice as `partial` or `failed`,
+- and it may require manual review for low-confidence or inconsistent cases,
+- but it should not confidently emit ungrounded or internally inconsistent structured data.
+
+In other words, the implementation optimizes for **zero silent hallucinations**, not for always forcing a value into every field.
 
 ### 1. Initial data processing & ingestion
 
@@ -133,13 +145,15 @@ This ensures all downstream components see a consistent representation (preproce
   - We provide an explicit JSON schema the model must return:
     - `line_items[]`: `description`, `quantity`, `unit_price`, `line_total`, `discount`, `extra_cost`, `source_line_ids`.
     - `summary`: `subtotal`, `total`, `currency`, `tax_bases[]`, `tax_rates[]`.
-    - `metadata`: `invoice_number`, `invoice_date`, `vendor_name`, `customer_name`.
+    - `metadata`: `invoice_number`, `invoice_date`, `due_date`, `purchase_order_number`, `currency`, `vendor_name`, `vendor_details`, `customer_name`, `customer_details`.
+  - `vendor_details` and `customer_details` each contain: `name`, `address_lines[]`, `tax_id`.
   - Instructions emphasize:
     - Only use values literally present in the text,
     - Use `null` when uncertain,
     - For line items, fill `source_line_ids`,
-    - For vendor/customer names, copy exact OCR line text when identifiable.
-  - When layout-based OCR extraction finds vendor/customer lines, those values override the LLM output.
+    - For vendor/customer names, use only the entity name (one line),
+    - Do NOT confuse invoice number with PO number, or invoice date with due date.
+  - When layout-based OCR extraction finds vendor/customer details, those values override the LLM output.
 - **Model & orchestration**:
   - Using Gemini via `google-generativeai` (`GEMINI_API_KEY`, `GEMINI_MODEL`).
   - `_run_extraction_pipeline(invoice_id)`:
@@ -158,7 +172,7 @@ The core of the challenge is ensuring we do **not** silently accept hallucinated
 #### 4.1 Token-level provenance
 
 - For each numeric field in every line item (`quantity`, `unit_price`, `line_total`, `discount`, `extra_cost`), we:
-  - Build a token index (`_build_token_index`) from `OcrPage` (line → tokens).
+  - Build a token index (`_build_token_index`) from `OcrPage` (line -> tokens).
   - Find tokens whose text matches the numeric value (`_token_refs_for_value`).
   - Store them as `TokenRef` objects in `InvoiceLineItem.source_tokens[field_name]`, containing:
     - `line_id`
@@ -178,7 +192,7 @@ If we cannot find corresponding tokens, that value is considered suspect.
   - **Subtotal vs sum of line totals**:
     - `sum(line_total)` vs `summary.subtotal`; mismatches produce `subtotal_mismatch` error.
   - **Total vs subtotal + tax**:
-    - Compute tax = Σ(`tax_base[i] * tax_rate[i] / 100`).
+    - Compute tax = sum(`tax_base[i] * tax_rate[i] / 100`).
     - Check `subtotal + computed_tax` vs `summary.total`; mismatches -> `total_mismatch` error.
 
 #### 4.3 OCR-grounding checks
@@ -189,14 +203,19 @@ If we cannot find corresponding tokens, that value is considered suspect.
   - This guarantees numeric values can be linked back to specific OCR tokens (no naked hallucinations).
 - Text metadata:
   - We compute normalized OCR line texts and:
-    - If `vendor_name` is not found in the OCR text → `vendor_not_in_ocr` error.
-    - If `customer_name` is not found → `customer_not_in_ocr` warning.
-  - **Layout-based metadata extraction** (no hardcoded string cleanup):
-    - `vendor_name`: first line of block 1 (header) from OCR, or first line before invoice/bill markers if block 1 is not identifiable.
-    - `customer_name`: first line after the `"Bill To"` marker.
-    - Uses raw OCR output; one OCR line per entity. Correctness depends on OCR line segmentation (PSM 3).
+    - If `vendor_name` is not found in the OCR text -> `vendor_not_in_ocr` error.
+    - If `customer_name` is not found -> `customer_not_in_ocr` warning.
+  - **Layout-based metadata extraction** using block segmentation:
+    - Vendor: extracted from labeled sections (`From`, `Seller`, `Supplier`, `Vendor`, `Pay To`) or from header lines before any section labels. Includes `name`, `address_lines`, and `tax_id`.
+    - Customer: extracted from labeled sections (`Bill To`, `Issued To`, `Ship To`, `Sold To`, `Deliver To`). Includes `name`, `address_lines`, and `tax_id`.
 
-#### 4.4 OCR quality metrics
+#### 4.4 Cross-field semantic validation
+
+- **Invoice number vs PO number**: Warns if the extracted invoice number starts with `PO` or `P.O`.
+- **Invoice date vs due date**: Warns if invoice date and due date are identical (likely extraction confusion).
+- **Completeness checks**: Warns if any critical field is null (`invoice_number`, `invoice_date`, `vendor_name`, `customer_name`, `subtotal`, `total`, or no line items).
+
+#### 4.5 OCR quality metrics
 
 - `_compute_ocr_quality` aggregates:
   - `page_count`
@@ -207,17 +226,17 @@ If we cannot find corresponding tokens, that value is considered suspect.
   - `low_avg_ocr_confidence`
   - `high_low_confidence_ratio`
 
-#### 4.5 Validation output
+#### 4.6 Validation output
 
 - `InvoiceValidation` model:
   - `status`: `"ok" | "partial" | "failed"`
   - `issues`: list of `ValidationIssue` with:
     - `level`: `"warning"` or `"error"`
-    - `code`: e.g. `line_total_mismatch`, `subtotal_mismatch`, `total_mismatch`, `missing_token_provenance`, `vendor_not_in_ocr`.
+    - `code`: e.g. `line_total_mismatch`, `subtotal_mismatch`, `total_mismatch`, `missing_token_provenance`, `vendor_not_in_ocr`, `invoice_number_looks_like_po`, `invoice_date_equals_due_date`, `missing_invoice_number`, `no_line_items`.
     - `message`
     - `path` indicating the field location (e.g. `line_items[1].line_total`).
 - The final `extraction.json` includes:
-  - `line_items`, `summary`, `metadata`
+  - `line_items`, `summary`, `metadata` (with `vendor_details` and `customer_details`)
   - `quality`
   - `validation`
 
@@ -248,9 +267,29 @@ Any serious inconsistency leads to `validation.status = "failed"`, and consumers
     - validation status counts,
     - average OCR confidence,
     - counts of validation errors/warnings,
-    - per-file extraction failure notes.
+    - per-file extraction failure notes,
+    - raw model output in a scrollable window for debugging.
 
 This makes the health of each extraction immediately visible to the user, not hidden in logs.
+
+### 5.1 High-level pipeline overview
+
+The implemented pipeline is:
+
+1. Upload invoice (`PDF` or image) via the web UI or `POST /ingest`.
+2. Normalize input into per-page PNG images.
+3. Run OCR and preserve token, line, block, confidence, and bounding-box data.
+4. Build a layout-aware prompt from OCR lines and ask the LLM for candidate JSON.
+5. Parse the LLM response into the fixed schema.
+6. Run deterministic block-based extraction for vendor/customer details.
+7. Override LLM metadata with deterministic OCR-based values where available.
+8. Attach token-level provenance for numeric fields.
+9. Validate: arithmetic consistency, OCR grounding, cross-field semantics, completeness, OCR quality.
+10. Persist:
+    - `extraction.json` for validated structured output,
+    - `extraction_raw.txt` for raw LLM output,
+    - page images for inspection and reproducibility.
+11. Treat any `partial` or `failed` result as requiring manual review rather than trusted automation.
 
 ### 6. Automated tests & sample set
 
@@ -268,16 +307,22 @@ This makes the health of each extraction immediately visible to the user, not hi
 
 This ensures the zero-hallucination engine does not silently accept wrong totals, and provides a basis for regression testing as the system evolves.
 
+### 7. Assumptions and current limitations
+
+- The system is strongest on invoices where OCR can separate lines and preserve table structure reasonably well.
+- Vendor/customer details are extracted using block-based segmentation and labeled sections, but may return imperfect results on highly unusual layouts.
+- The implementation does not guarantee that every invoice will produce a fully populated JSON object; instead, it guarantees that doubtful cases are surfaced through `null`, warnings, or failed validation rather than silently accepted.
+- Payment-specific fields (IBAN, SWIFT, bank name) are not yet normalized into the structured schema but are available in the raw OCR output.
+
 ---
 
 In summary, this codebase implements the challenge requirements with:
 
 - a robust ingestion and normalization step,
-- layout-aware OCR,
+- layout-aware OCR with block-level structure,
 - schema-constrained LLM extraction used only as a candidate generator,
-- **layout-based metadata extraction** for vendor/customer (one OCR line per entity, no hardcoded string cleanup),
-- a dedicated zero-hallucination engine that re-computes and validates all critical values,
-- explicit provenance to OCR tokens,
+- **block-based metadata extraction** for vendor/customer including name, address, and tax ID,
+- a dedicated zero-hallucination engine with arithmetic checks, token provenance, OCR grounding, cross-field semantics, and completeness warnings,
+- explicit provenance linking numeric values to OCR tokens,
 - surfaced quality/validation in both API and UI,
 - and automated tests around both clean and adversarial invoice scenarios.
-

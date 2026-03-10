@@ -3,6 +3,7 @@
   "ocr_lines": [
     "Globex Corporation",
     "Invoice Number: INV-2025-1001",
+    "Invoice Date: 2025-11-05",
     "Bill To:",
     "TalkyLabs AG",
     "Page 1",
@@ -74,8 +75,13 @@
     "metadata": {
       "invoice_number": "INV-2025-1001",
       "invoice_date": "2025-11-05",
+      "due_date": null,
+      "purchase_order_number": null,
+      "currency": null,
       "vendor_name": "Globex Corporation",
-      "customer_name": "TalkyLabs AG"
+      "vendor_details": null,
+      "customer_name": "TalkyLabs AG",
+      "customer_details": null
     },
     "raw_model_output": {}
   },

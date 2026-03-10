@@ -89,8 +89,13 @@
     "metadata": {
       "invoice_number": "INV-2025-0042",
       "invoice_date": "2025-11-03",
+      "due_date": null,
+      "purchase_order_number": null,
+      "currency": null,
       "vendor_name": "ACME Supplies GmbH",
-      "customer_name": "TalkyLabs AG"
+      "vendor_details": null,
+      "customer_name": "TalkyLabs AG",
+      "customer_details": null
     },
     "raw_model_output": {}
   },

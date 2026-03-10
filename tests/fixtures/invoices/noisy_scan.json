@@ -3,6 +3,7 @@
   "ocr_lines": [
     "ACME Supplles GmbH",
     "Invoice Number: INV-2025-0042",
+    "Invoice Date: 2025-11-03",
     "Bill To:",
     "TalkyLabs AG",
     "Hosting Pro Plan 2 250.00 EUR 0.00 EUR 500.00 EUR",
@@ -40,8 +41,13 @@
     "metadata": {
       "invoice_number": "INV-2025-0042",
       "invoice_date": "2025-11-03",
+      "due_date": null,
+      "purchase_order_number": null,
+      "currency": null,
       "vendor_name": "ACME Supplles GmbH",
-      "customer_name": "TalkyLabs AG"
+      "vendor_details": null,
+      "customer_name": "TalkyLabs AG",
+      "customer_details": null
     },
     "raw_model_output": {}
   },

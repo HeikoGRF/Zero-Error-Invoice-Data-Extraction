@@ -164,55 +164,172 @@ def _text_in_ocr_lines(value: str | None, ocr_lines: List[str]) -> bool:
     return any(needle in _normalize_text(line) for line in ocr_lines)
 
 
-def _extract_vendor_customer_from_ocr(pages: List[OcrPage]) -> Tuple[str | None, str | None]:
+def _is_label_line(line: str) -> bool:
+    """True if a line is purely a section label like 'Bill To:', 'Issued To:', etc."""
+    norm = _normalize_text(line).rstrip(":")
+    return norm in (
+        "bill to", "issued to", "ship to", "sold to", "deliver to",
+        "from", "seller", "supplier", "vendor", "pay to",
+        "invoice", "sales invoice", "tax invoice", "credit note",
+    )
+
+
+def _extract_block_lines(pages: List[OcrPage]) -> Dict[str, List[str]]:
     """
-    Layout-based extraction: one OCR line per entity, no string cleanup.
-    - vendor: first line of block 1 (header), or first line before invoice/bill markers
-    - customer: first line after a 'Bill To' marker
+    Group OCR lines by Tesseract block on page 1.
+    Returns { block_id: [line_text, ...] } in reading order.
     """
     if not pages:
-        return None, None
+        return {}
+    page1 = pages[0]
+    blocks: Dict[str, List[str]] = {}
+    for line in sorted(page1.lines, key=lambda l: l.reading_order_index):
+        text = " ".join(token.text for token in line.tokens).strip()
+        if not text:
+            continue
+        bid = line.tokens[0].block_id if line.tokens else "unknown"
+        blocks.setdefault(bid, []).append(text)
+    return blocks
+
+
+def _extract_entity_from_labeled_block(
+    lines: List[str], label_idx: int
+) -> Tuple[str | None, List[str], str | None]:
+    """
+    Given a list of OCR lines and the index of a label line (e.g. 'Bill To:'),
+    extract: (name, address_lines, tax_id) from lines that follow.
+    """
+    name: str | None = None
+    address_lines: List[str] = []
+    tax_id: str | None = None
+
+    vat_pattern = re.compile(r"\b[A-Z]{2}\d{5,}\b")
+    stop_labels = (
+        "invoice", "bill to", "issued to", "ship to", "sold to",
+        "deliver to", "from", "seller", "supplier", "vendor", "pay to",
+        "subtotal", "total", "tax", "vat", "description", "qty",
+        "quantity", "unit price", "amount", "item",
+    )
+
+    for candidate in lines[label_idx + 1 :]:
+        norm = _normalize_text(candidate)
+        if any(w in norm for w in stop_labels) and len(norm) < 40:
+            break
+        if not norm or len(norm) < 2:
+            continue
+
+        vat_match = vat_pattern.search(candidate)
+        if vat_match and not name:
+            tax_id = vat_match.group(0)
+            continue
+        if vat_match and name:
+            tax_id = vat_match.group(0)
+            continue
+
+        if name is None:
+            name = candidate.strip()
+        else:
+            address_lines.append(candidate.strip())
+
+    return name, address_lines, tax_id
+
+
+def _extract_vendor_customer_from_ocr(
+    pages: List[OcrPage],
+) -> Tuple[
+    str | None, EntityDetails | None,
+    str | None, EntityDetails | None,
+]:
+    """
+    Layout-based extraction using block structure and labeled sections.
+    Returns (vendor_name, vendor_details, customer_name, customer_details).
+    """
+    if not pages:
+        return None, None, None, None
 
     page1 = pages[0]
-    lines_with_ids = [
-        (line.id, " ".join(token.text for token in line.tokens).strip())
+    lines_with_meta = [
+        (line.id, line.tokens[0].block_id if line.tokens else "",
+         " ".join(token.text for token in line.tokens).strip())
         for line in sorted(page1.lines, key=lambda l: l.reading_order_index)
     ]
-    lines_with_ids = [(lid, text) for lid, text in lines_with_ids if text]
-    if not lines_with_ids:
-        return None, None
+    lines_with_meta = [(lid, bid, text) for lid, bid, text in lines_with_meta if text]
+    if not lines_with_meta:
+        return None, None, None, None
 
-    lines = [t for _, t in lines_with_ids]
-    vendor: str | None = None
-    customer: str | None = None
+    lines = [t for _, _, t in lines_with_meta]
 
-    # Vendor: first line of block 1 (header) if identifiable, else first line before markers.
-    block1_lines = [t for lid, t in lines_with_ids if lid.startswith("p1_b1_")]
-    if block1_lines:
-        vendor = block1_lines[0]
+    vendor_name: str | None = None
+    vendor_details: EntityDetails | None = None
+    customer_name: str | None = None
+    customer_details: EntityDetails | None = None
+
+    # Customer: first labeled block matching customer markers.
+    customer_markers = ("bill to", "issued to", "ship to", "sold to", "deliver to")
+    cust_idx = None
+    for i, line in enumerate(lines):
+        norm = _normalize_text(line)
+        if any(m in norm for m in customer_markers):
+            cust_idx = i
+            break
+    if cust_idx is not None:
+        c_name, c_addr, c_tax = _extract_entity_from_labeled_block(lines, cust_idx)
+        customer_name = c_name
+        customer_details = EntityDetails(
+            name=c_name,
+            address_lines=c_addr or None,
+            tax_id=c_tax,
+        )
+
+    # Vendor: first labeled block matching vendor markers, or header lines.
+    vendor_markers = ("from", "seller", "supplier", "vendor", "pay to")
+    vendor_idx = None
+    for i, line in enumerate(lines):
+        norm = _normalize_text(line)
+        if any(m in norm for m in vendor_markers):
+            vendor_idx = i
+            break
+    if vendor_idx is not None:
+        v_name, v_addr, v_tax = _extract_entity_from_labeled_block(lines, vendor_idx)
+        vendor_name = v_name
+        vendor_details = EntityDetails(
+            name=v_name,
+            address_lines=v_addr or None,
+            tax_id=v_tax,
+        )
     else:
-        stop_words = ("invoice", "bill to", "due date", "purchase order")
+        # Fallback: header lines before any label.
+        stop_words = (
+            "invoice", "bill to", "issued to", "ship to", "sold to",
+            "due date", "purchase order", "date", "pay to",
+        )
+        header_lines: List[str] = []
         for line in lines:
             norm = _normalize_text(line)
             if any(w in norm for w in stop_words):
                 break
+            if _is_label_line(line):
+                break
             if len(norm) >= 3:
-                vendor = line
-                break
+                header_lines.append(line.strip())
+        if header_lines:
+            vendor_name = header_lines[0]
+            vat_pattern = re.compile(r"\b[A-Z]{2}\d{5,}\b")
+            v_tax = None
+            v_addr = []
+            for hl in header_lines[1:]:
+                vm = vat_pattern.search(hl)
+                if vm:
+                    v_tax = vm.group(0)
+                else:
+                    v_addr.append(hl)
+            vendor_details = EntityDetails(
+                name=vendor_name,
+                address_lines=v_addr or None,
+                tax_id=v_tax,
+            )
 
-    # Customer: first line after "Bill To" marker.
-    bill_idx = None
-    for i, line in enumerate(lines):
-        if "bill to" in _normalize_text(line):
-            bill_idx = i
-            break
-    if bill_idx is not None:
-        for candidate in lines[bill_idx + 1 :]:
-            if len(_normalize_text(candidate)) >= 3:
-                customer = candidate
-                break
-
-    return vendor, customer
+    return vendor_name, vendor_details, customer_name, customer_details
 
 
 def _extract_invoice_number_and_date_from_ocr(ocr_lines: List[str]) -> Tuple[str | None, str | None]:
@@ -427,11 +544,22 @@ class InvoiceSummary(BaseModel):
     tax_rates: List[float] | None = None
 
 
+class EntityDetails(BaseModel):
+    name: str | None = None
+    address_lines: List[str] | None = None
+    tax_id: str | None = None
+
+
 class InvoiceMetadata(BaseModel):
     invoice_number: str | None = None
     invoice_date: str | None = None
+    due_date: str | None = None
+    purchase_order_number: str | None = None
+    currency: str | None = None
     vendor_name: str | None = None
+    vendor_details: EntityDetails | None = None
     customer_name: str | None = None
+    customer_details: EntityDetails | None = None
 
 
 class InvoiceExtraction(BaseModel):
@@ -495,7 +623,7 @@ async def upload_form() -> str:
             border-radius: 1rem;
             padding: 2rem 2.5rem;
             box-shadow: 0 24px 60px rgba(15, 23, 42, 0.8);
-            max-width: 480px;
+            max-width: 560px;
             width: 100%;
             border: 1px solid rgba(148, 163, 184, 0.25);
           }
@@ -554,6 +682,27 @@ async def upload_form() -> str:
           .summary-issues {
             margin-top: 0.55rem;
             color: #fca5a5;
+          }
+          .raw-output {
+            margin-top: 1rem;
+            max-height: 280px;
+            overflow-y: auto;
+            overflow-x: auto;
+            padding: 1rem;
+            border-radius: 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            background-color: rgba(15, 23, 42, 0.9);
+            font-family: ui-monospace, "Cascadia Code", "Source Code Pro", monospace;
+            font-size: 0.8rem;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: #94a3b8;
+          }
+          .raw-output-label {
+            font-size: 0.85rem;
+            color: #94a3b8;
+            margin-bottom: 0.4rem;
           }
           button {
             width: 100%;
@@ -655,6 +804,26 @@ async def upload_form() -> str:
                   )
                   .join("");
 
+                const rawOutputs = files
+                  .filter((f) => f.extraction_raw)
+                  .map(
+                    (f) => {
+                      const pre = document.createElement("pre");
+                      pre.className = "raw-output";
+                      pre.textContent = f.extraction_raw;
+                      const wrap = document.createElement("div");
+                      wrap.innerHTML = `<div class="raw-output-label">${escapeHtml(f.original_filename)} — raw output</div>`;
+                      wrap.appendChild(pre);
+                      return wrap;
+                    }
+                  );
+
+                function escapeHtml(s) {
+                  const div = document.createElement("div");
+                  div.textContent = s;
+                  return div.innerHTML;
+                }
+
                 summaryEl.innerHTML = `
                   <h2>Extraction Summary</h2>
                   <div class="summary-line">Files uploaded: ${files.length}</div>
@@ -665,6 +834,7 @@ async def upload_form() -> str:
                   <div class="summary-line">Validation issues - errors: ${errorIssues}, warnings: ${warningIssues}</div>
                   ${failedFiles ? `<div class="summary-issues">${failedFiles}</div>` : ""}
                 `;
+                rawOutputs.forEach((el) => summaryEl.appendChild(el));
                 summaryEl.style.display = "block";
                 form.reset();
               } else {
@@ -749,6 +919,7 @@ async def ingest_documents(
             extraction, raw = await _run_extraction_pipeline(invoice_id)
             _persist_extraction_files(invoice_id, extraction, raw)
             ingested_files[-1]["extraction_created"] = True
+            ingested_files[-1]["extraction_raw"] = raw
             ingested_files[-1]["quality"] = (
                 extraction.quality.model_dump() if extraction.quality else None
             )
@@ -942,8 +1113,21 @@ Return a JSON object with the following structure and NO additional commentary:
   "metadata": {
     "invoice_number": string | null,
     "invoice_date": string | null,
+    "due_date": string | null,
+    "purchase_order_number": string | null,
+    "currency": string | null,
     "vendor_name": string | null,
-    "customer_name": string | null
+    "vendor_details": {
+      "name": string | null,
+      "address_lines": [string, ...] | null,
+      "tax_id": string | null
+    } | null,
+    "customer_name": string | null,
+    "customer_details": {
+      "name": string | null,
+      "address_lines": [string, ...] | null,
+      "tax_id": string | null
+    } | null
   }
 }
 If any value is missing or ambiguous in the text, set it explicitly to null. Do NOT invent values.
@@ -954,10 +1138,13 @@ You are given OCR-extracted lines from one invoice, with page numbers and stable
 Your task is to:
 - Identify line items (product/service rows) and map them to the fields in the schema.
 - Identify summary fields (subtotal, tax bases + rates, total).
-- Identify invoice-level metadata (invoice number, date, vendor, customer).
+- Identify invoice-level metadata (invoice number, date, due date, PO number, vendor, customer).
 - For each numeric field, only use numbers that appear in the text.
 - For each line item, fill source_line_ids with the line_id(s) the row came from.
-- For vendor_name and customer_name, copy the exact OCR line text (no abbreviations).
+- For vendor_name and customer_name, use ONLY the entity name (one line), not the full address block.
+- For vendor_details and customer_details, extract the name, address lines, and tax ID separately.
+- Do NOT confuse "Invoice Number" with "PO Number" or "Order Number".
+- Do NOT confuse "Invoice Date" with "Due Date".
 - If something is unclear or not present, use null for that field instead of guessing.
 
 INVOICE_ID={invoice_id}
@@ -994,6 +1181,17 @@ async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, 
             f"LLM did not return valid JSON. Raw output starts with: {raw[:200]!r}"
         ) from exc
 
+    meta_raw = parsed.get("metadata", {})
+
+    def _parse_entity_details(d: dict | None) -> EntityDetails | None:
+        if not d or not isinstance(d, dict):
+            return None
+        return EntityDetails(
+            name=d.get("name"),
+            address_lines=d.get("address_lines"),
+            tax_id=d.get("tax_id"),
+        )
+
     extraction = InvoiceExtraction(
         invoice_id=invoice_id,
         line_items=[
@@ -1016,25 +1214,34 @@ async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, 
             tax_rates=parsed.get("summary", {}).get("tax_rates"),
         ),
         metadata=InvoiceMetadata(
-            invoice_number=parsed.get("metadata", {}).get("invoice_number"),
-            invoice_date=parsed.get("metadata", {}).get("invoice_date"),
-            vendor_name=parsed.get("metadata", {}).get("vendor_name"),
-            customer_name=parsed.get("metadata", {}).get("customer_name"),
+            invoice_number=meta_raw.get("invoice_number"),
+            invoice_date=meta_raw.get("invoice_date"),
+            due_date=meta_raw.get("due_date"),
+            purchase_order_number=meta_raw.get("purchase_order_number"),
+            currency=meta_raw.get("currency") or parsed.get("summary", {}).get("currency"),
+            vendor_name=meta_raw.get("vendor_name"),
+            vendor_details=_parse_entity_details(meta_raw.get("vendor_details")),
+            customer_name=meta_raw.get("customer_name"),
+            customer_details=_parse_entity_details(meta_raw.get("customer_details")),
         ),
         raw_model_output=parsed,
     )
 
     # Deterministic metadata correction from OCR anchors to reduce LLM drift.
     ocr_lines = _collect_ocr_line_texts(pages)
-    ocr_vendor, ocr_customer = _extract_vendor_customer_from_ocr(pages)
+    (ocr_vendor, ocr_vendor_details,
+     ocr_customer, ocr_customer_details) = _extract_vendor_customer_from_ocr(pages)
     ocr_invoice_number, ocr_invoice_date = _extract_invoice_number_and_date_from_ocr(ocr_lines)
 
     # OCR-anchored metadata overrides LLM values when available.
-    # Layout-based: one OCR line per entity, no string cleanup.
     if ocr_vendor:
         extraction.metadata.vendor_name = ocr_vendor.strip() or None
+    if ocr_vendor_details:
+        extraction.metadata.vendor_details = ocr_vendor_details
     if ocr_customer:
         extraction.metadata.customer_name = ocr_customer.strip() or None
+    if ocr_customer_details:
+        extraction.metadata.customer_details = ocr_customer_details
     if ocr_invoice_number:
         extraction.metadata.invoice_number = ocr_invoice_number
     if ocr_invoice_date:
@@ -1232,6 +1439,80 @@ def _validate_extraction(
                     f"Customer name {extraction.metadata.customer_name!r} not found in OCR text."
                 ),
                 path="metadata.customer_name",
+            )
+        )
+
+    # Cross-field: invoice_number should not look like a PO number.
+    inv_num = extraction.metadata.invoice_number
+    if inv_num:
+        inv_norm = _normalize_text(inv_num)
+        if inv_norm.startswith("po") or inv_norm.startswith("p.o"):
+            issues.append(
+                ValidationIssue(
+                    level="warning",
+                    code="invoice_number_looks_like_po",
+                    message=f"Invoice number {inv_num!r} looks like a PO number.",
+                    path="metadata.invoice_number",
+                )
+            )
+
+    # Cross-field: invoice_date should not equal due_date (likely confusion).
+    if (
+        extraction.metadata.invoice_date
+        and extraction.metadata.due_date
+        and extraction.metadata.invoice_date == extraction.metadata.due_date
+    ):
+        issues.append(
+            ValidationIssue(
+                level="warning",
+                code="invoice_date_equals_due_date",
+                message="Invoice date and due date are identical; possible extraction confusion.",
+                path="metadata.invoice_date",
+            )
+        )
+
+    # Completeness: warn if key fields are null.
+    for field_name, field_label in [
+        ("invoice_number", "Invoice number"),
+        ("invoice_date", "Invoice date"),
+        ("vendor_name", "Vendor name"),
+        ("customer_name", "Customer name"),
+    ]:
+        if getattr(extraction.metadata, field_name) is None:
+            issues.append(
+                ValidationIssue(
+                    level="warning",
+                    code=f"missing_{field_name}",
+                    message=f"{field_label} could not be determined.",
+                    path=f"metadata.{field_name}",
+                )
+            )
+
+    if extraction.summary.subtotal is None:
+        issues.append(
+            ValidationIssue(
+                level="warning",
+                code="missing_subtotal",
+                message="Subtotal could not be determined.",
+                path="summary.subtotal",
+            )
+        )
+    if extraction.summary.total is None:
+        issues.append(
+            ValidationIssue(
+                level="warning",
+                code="missing_total",
+                message="Total could not be determined.",
+                path="summary.total",
+            )
+        )
+    if not extraction.line_items:
+        issues.append(
+            ValidationIssue(
+                level="warning",
+                code="no_line_items",
+                message="No line items were extracted.",
+                path="line_items",
             )
         )
 
