@@ -30,6 +30,10 @@ BASE_STORAGE_DIR = Path("storage") / "ingested"
 # Load environment variables from .env if present.
 load_dotenv()
 
+# OCR page segmentation mode. 3 is more robust for mixed invoice layouts;
+# mode 6 tended to merge many regions into one line on degraded images.
+OCR_PSM = os.getenv("OCR_PSM", "3")
+
 
 def ensure_storage_dir() -> None:
     BASE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -131,6 +135,79 @@ def _collect_ocr_numbers_by_line(pages: List[OcrPage]) -> Dict[str, List[str]]:
                     bucket.append(match)
 
     return line_numbers
+
+
+def _collect_ocr_line_texts(pages: List[OcrPage]) -> List[str]:
+    """
+    Collect full OCR line texts in reading order.
+    """
+    texts: List[str] = []
+    for page in pages:
+        for line in sorted(page.lines, key=lambda l: l.reading_order_index):
+            txt = " ".join(token.text for token in line.tokens).strip()
+            if txt:
+                texts.append(txt)
+    return texts
+
+
+def _normalize_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+def _text_in_ocr_lines(value: str | None, ocr_lines: List[str]) -> bool:
+    """
+    Check whether a text value appears in OCR line texts (case-insensitive).
+    """
+    if not value:
+        return False
+    needle = _normalize_text(value)
+    return any(needle in _normalize_text(line) for line in ocr_lines)
+
+
+def _extract_vendor_customer_from_ocr(pages: List[OcrPage]) -> Tuple[str | None, str | None]:
+    """
+    Deterministic fallback for vendor/customer from OCR layout:
+    - vendor: first meaningful line near top of page 1
+    - customer: first line after a 'Bill To' marker
+    """
+    if not pages:
+        return None, None
+
+    page1 = pages[0]
+    lines = [
+        " ".join(token.text for token in line.tokens).strip()
+        for line in sorted(page1.lines, key=lambda l: l.reading_order_index)
+    ]
+    lines = [l for l in lines if l]
+    if not lines:
+        return None, None
+
+    vendor: str | None = None
+    customer: str | None = None
+
+    # Vendor candidate: first line before invoice/bill markers.
+    stop_words = ("invoice", "bill to", "due date", "purchase order")
+    for line in lines:
+        norm = _normalize_text(line)
+        if any(w in norm for w in stop_words):
+            break
+        if len(norm) >= 3:
+            vendor = line
+            break
+
+    # Customer candidate: line right after "Bill To" marker.
+    bill_idx = None
+    for i, line in enumerate(lines):
+        if "bill to" in _normalize_text(line):
+            bill_idx = i
+            break
+    if bill_idx is not None:
+        for candidate in lines[bill_idx + 1 :]:
+            if len(_normalize_text(candidate)) >= 3:
+                customer = candidate
+                break
+
+    return vendor, customer
 
 
 def _value_appears_in_ocr(
@@ -240,6 +317,38 @@ def _attach_token_provenance(extraction: InvoiceExtraction, pages: List[OcrPage]
             item.source_tokens[field_name] = refs
 
 
+def _compute_ocr_quality(pages: List[OcrPage]) -> OcrQuality:
+    """
+    Compute simple OCR quality metrics to expose in API/UI.
+    """
+    confidences: List[float] = []
+    for page in pages:
+        for line in page.lines:
+            for token in line.tokens:
+                if token.confidence >= 0:
+                    confidences.append(token.confidence)
+
+    token_count = len(confidences)
+    if token_count == 0:
+        return OcrQuality(
+            page_count=len(pages),
+            token_count=0,
+            avg_token_confidence=0.0,
+            low_confidence_ratio=1.0,
+        )
+
+    low_count = sum(1 for c in confidences if c < 60.0)
+    avg_conf = sum(confidences) / token_count
+    low_ratio = low_count / token_count
+
+    return OcrQuality(
+        page_count=len(pages),
+        token_count=token_count,
+        avg_token_confidence=round(avg_conf, 2),
+        low_confidence_ratio=round(low_ratio, 4),
+    )
+
+
 class OcrToken(BaseModel):
     text: str
     bbox: Tuple[float, float, float, float]
@@ -302,6 +411,7 @@ class InvoiceExtraction(BaseModel):
     summary: InvoiceSummary
     metadata: InvoiceMetadata
     raw_model_output: dict
+    quality: "OcrQuality | None" = None
     validation: "InvoiceValidation | None" = None
 
 
@@ -315,6 +425,13 @@ class ValidationIssue(BaseModel):
 class InvoiceValidation(BaseModel):
     status: Literal["ok", "partial", "failed"]
     issues: List[ValidationIssue]
+
+
+class OcrQuality(BaseModel):
+    page_count: int
+    token_count: int
+    avg_token_confidence: float
+    low_confidence_ratio: float
 
 
 InvoiceExtraction.model_rebuild()
@@ -381,12 +498,33 @@ async def upload_form() -> str:
           .status {
             margin-top: 1rem;
             font-size: 0.9rem;
+            white-space: pre-wrap;
           }
           .status--success {
             color: #4ade80;
           }
           .status--error {
             color: #f97373;
+          }
+          .summary {
+            margin-top: 1rem;
+            padding: 0.85rem 1rem;
+            border-radius: 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            background-color: rgba(15, 23, 42, 0.6);
+            font-size: 0.9rem;
+          }
+          .summary h2 {
+            margin: 0 0 0.5rem 0;
+            font-size: 1rem;
+          }
+          .summary-line {
+            color: #cbd5e1;
+            margin: 0.15rem 0;
+          }
+          .summary-issues {
+            margin-top: 0.55rem;
+            color: #fca5a5;
           }
           button {
             width: 100%;
@@ -431,15 +569,19 @@ async def upload_form() -> str:
             <button type="submit">Ingest documents</button>
           </form>
           <div id="status" class="status"></div>
+          <div id="summary" class="summary" style="display:none;"></div>
         </div>
         <script>
           const form = document.getElementById("upload-form");
           const statusEl = document.getElementById("status");
+          const summaryEl = document.getElementById("summary");
 
           form.addEventListener("submit", async (event) => {
             event.preventDefault();
             statusEl.textContent = "Uploading...";
             statusEl.className = "status";
+            summaryEl.style.display = "none";
+            summaryEl.innerHTML = "";
 
             const formData = new FormData(form);
 
@@ -455,8 +597,46 @@ async def upload_form() -> str:
               const data = isJson ? await response.json() : null;
 
               if (response.ok && data?.status === "ok") {
+                const files = data.files || [];
+                const createdCount = files.filter((f) => f.extraction_created).length;
+                const failedCount = files.length - createdCount;
+                const okCount = files.filter((f) => f.validation?.status === "ok").length;
+                const partialCount = files.filter((f) => f.validation?.status === "partial").length;
+                const failedValidationCount = files.filter((f) => f.validation?.status === "failed").length;
+
+                const avgConfValues = files
+                  .map((f) => f.quality?.avg_token_confidence)
+                  .filter((v) => typeof v === "number");
+                const avgConf = avgConfValues.length
+                  ? (avgConfValues.reduce((a, b) => a + b, 0) / avgConfValues.length).toFixed(2)
+                  : "n/a";
+
+                const allIssues = files.flatMap((f) => f.validation?.issues || []);
+                const errorIssues = allIssues.filter((i) => i.level === "error").length;
+                const warningIssues = allIssues.filter((i) => i.level === "warning").length;
+
                 statusEl.textContent = "Upload successful.";
                 statusEl.className = "status status--success";
+
+                const failedFiles = files
+                  .filter((f) => !f.extraction_created)
+                  .map(
+                    (f) =>
+                      `<div class="summary-line">- ${f.original_filename}: extraction failed (${f.extraction_error || "unknown error"})</div>`
+                  )
+                  .join("");
+
+                summaryEl.innerHTML = `
+                  <h2>Extraction Summary</h2>
+                  <div class="summary-line">Files uploaded: ${files.length}</div>
+                  <div class="summary-line">Extractions created: ${createdCount}</div>
+                  <div class="summary-line">Extraction failures: ${failedCount}</div>
+                  <div class="summary-line">Validation status - ok: ${okCount}, partial: ${partialCount}, failed: ${failedValidationCount}</div>
+                  <div class="summary-line">Average OCR confidence: ${avgConf}</div>
+                  <div class="summary-line">Validation issues - errors: ${errorIssues}, warnings: ${warningIssues}</div>
+                  ${failedFiles ? `<div class="summary-issues">${failedFiles}</div>` : ""}
+                `;
+                summaryEl.style.display = "block";
                 form.reset();
               } else {
                 const detail =
@@ -464,10 +644,12 @@ async def upload_form() -> str:
                   `Status ${response.status}`;
                 statusEl.textContent = `Upload failed: ${detail}`;
                 statusEl.className = "status status--error";
+                summaryEl.style.display = "none";
               }
             } catch (error) {
               statusEl.textContent = "Upload failed: network or server error.";
               statusEl.className = "status status--error";
+              summaryEl.style.display = "none";
             }
           });
         </script>
@@ -538,6 +720,12 @@ async def ingest_documents(
             extraction, raw = await _run_extraction_pipeline(invoice_id)
             _persist_extraction_files(invoice_id, extraction, raw)
             ingested_files[-1]["extraction_created"] = True
+            ingested_files[-1]["quality"] = (
+                extraction.quality.model_dump() if extraction.quality else None
+            )
+            ingested_files[-1]["validation"] = (
+                extraction.validation.model_dump() if extraction.validation else None
+            )
         except Exception as exc:
             extraction_error = str(exc)
             ingested_files[-1]["extraction_created"] = False
@@ -588,7 +776,7 @@ async def _perform_ocr(invoice_id: str) -> List[OcrPage]:
             data = pytesseract.image_to_data(
                 img,
                 output_type=Output.DICT,
-                config="--psm 6",  # assume a uniform block of text with some structure
+                config=f"--psm {OCR_PSM}",
             )
 
             lines_map: Dict[Tuple[int, int], List[OcrToken]] = {}
@@ -740,6 +928,7 @@ Your task is to:
 - Identify invoice-level metadata (invoice number, date, vendor, customer).
 - For each numeric field, only use numbers that appear in the text.
 - For each line item, fill source_line_ids with the line_id(s) the row came from.
+- For vendor_name and customer_name, copy the exact OCR line text (no abbreviations).
 - If something is unclear or not present, use null for that field instead of guessing.
 
 INVOICE_ID={invoice_id}
@@ -806,12 +995,59 @@ async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, 
         raw_model_output=parsed,
     )
 
+    # Deterministic metadata correction from OCR anchors to reduce LLM drift.
+    ocr_vendor, ocr_customer = _extract_vendor_customer_from_ocr(pages)
+    ocr_lines = _collect_ocr_line_texts(pages)
+    if ocr_vendor and not _text_in_ocr_lines(extraction.metadata.vendor_name, ocr_lines):
+        extraction.metadata.vendor_name = ocr_vendor
+    if ocr_customer and not _text_in_ocr_lines(extraction.metadata.customer_name, ocr_lines):
+        extraction.metadata.customer_name = ocr_customer
+
+    # Compute and attach OCR quality metrics.
+    extraction.quality = _compute_ocr_quality(pages)
+
     # Attach token-level provenance for numeric fields (line items).
     _attach_token_provenance(extraction, pages)
 
     # Run zero-hallucination validation on top of the extraction.
     ocr_numbers_by_line = _collect_ocr_numbers_by_line(pages)
-    extraction.validation = _validate_extraction(invoice_id, extraction, ocr_numbers_by_line)
+    extraction.validation = _validate_extraction(
+        invoice_id,
+        extraction,
+        ocr_numbers_by_line,
+        ocr_lines,
+    )
+
+    # Add quality-derived warnings to validation output.
+    if extraction.validation and extraction.quality:
+        if extraction.quality.avg_token_confidence < 70.0:
+            extraction.validation.issues.append(
+                ValidationIssue(
+                    level="warning",
+                    code="low_avg_ocr_confidence",
+                    message=(
+                        f"Average OCR confidence is low ({extraction.quality.avg_token_confidence:.2f}). "
+                        "Extraction reliability may be reduced."
+                    ),
+                    path="quality.avg_token_confidence",
+                )
+            )
+        if extraction.quality.low_confidence_ratio > 0.35:
+            extraction.validation.issues.append(
+                ValidationIssue(
+                    level="warning",
+                    code="high_low_confidence_ratio",
+                    message=(
+                        f"High ratio of low-confidence OCR tokens ({extraction.quality.low_confidence_ratio:.2%}). "
+                        "Manual review is recommended."
+                    ),
+                    path="quality.low_confidence_ratio",
+                )
+            )
+        # Update status if only warnings were added.
+        has_error = any(i.level == "error" for i in extraction.validation.issues)
+        if not has_error and extraction.validation.issues:
+            extraction.validation.status = "partial"
 
     return extraction, raw
 
@@ -835,6 +1071,7 @@ def _validate_extraction(
     invoice_id: str,
     extraction: InvoiceExtraction,
     ocr_numbers_by_line: Dict[str, List[str]],
+    ocr_lines: List[str],
 ) -> InvoiceValidation:
     """
     Zero-hallucination validation:
@@ -932,6 +1169,35 @@ def _validate_extraction(
                 )
             )
 
+    # Metadata text presence checks.
+    if extraction.metadata.vendor_name and not _text_in_ocr_lines(
+        extraction.metadata.vendor_name, ocr_lines
+    ):
+        issues.append(
+            ValidationIssue(
+                level="error",
+                code="vendor_not_in_ocr",
+                message=(
+                    f"Vendor name {extraction.metadata.vendor_name!r} not found in OCR text."
+                ),
+                path="metadata.vendor_name",
+            )
+        )
+
+    if extraction.metadata.customer_name and not _text_in_ocr_lines(
+        extraction.metadata.customer_name, ocr_lines
+    ):
+        issues.append(
+            ValidationIssue(
+                level="warning",
+                code="customer_not_in_ocr",
+                message=(
+                    f"Customer name {extraction.metadata.customer_name!r} not found in OCR text."
+                ),
+                path="metadata.customer_name",
+            )
+        )
+
     # Determine overall status.
     has_error = any(i.level == "error" for i in issues)
     status: Literal["ok", "partial", "failed"]
@@ -959,4 +1225,29 @@ async def extract_invoice(invoice_id: str) -> JSONResponse:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return JSONResponse(extraction.model_dump())
+
+
+@app.get("/analysis/{invoice_id}")
+async def get_analysis(invoice_id: str) -> JSONResponse:
+    """
+    Return a compact analysis view focused on validation + OCR quality.
+    Uses extraction.json if available, otherwise runs extraction pipeline once.
+    """
+    result_path = BASE_STORAGE_DIR / invoice_id / "extraction.json"
+    payload: dict
+
+    if result_path.exists():
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    else:
+        extraction, raw = await _run_extraction_pipeline(invoice_id)
+        _persist_extraction_files(invoice_id, extraction, raw)
+        payload = extraction.model_dump()
+
+    return JSONResponse(
+        {
+            "invoice_id": invoice_id,
+            "quality": payload.get("quality"),
+            "validation": payload.get("validation"),
+        }
+    )
 
