@@ -170,12 +170,90 @@ def _value_appears_in_ocr(
     return False
 
 
+def _build_token_index(pages: List[OcrPage]) -> Dict[str, List[OcrToken]]:
+    """
+    Map line_id -> ordered tokens (with token_index set).
+    """
+    idx: Dict[str, List[OcrToken]] = {}
+    for page in pages:
+        for line in page.lines:
+            idx[line.id] = line.tokens
+    return idx
+
+
+def _token_refs_for_value(
+    value: float | int,
+    source_line_ids: List[str],
+    tokens_by_line: Dict[str, List[OcrToken]],
+) -> List[TokenRef]:
+    """
+    Find OCR tokens (within the provided source_line_ids) that contain the given
+    numeric value (best-effort string matching with normalization).
+    """
+    if value is None or not source_line_ids:
+        return []
+
+    candidates: List[str] = []
+    try:
+        candidates.append(str(int(value)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        candidates.append(f"{float(value):.2f}")
+    except (TypeError, ValueError):
+        pass
+
+    normalized_candidates = [c.replace(",", ".") for c in candidates if c]
+    refs: List[TokenRef] = []
+
+    for line_id in source_line_ids:
+        for tok in tokens_by_line.get(line_id, []):
+            t = tok.text.replace(",", ".")
+            if tok.token_index is None:
+                continue
+            if any(c and c in t for c in normalized_candidates):
+                refs.append(
+                    TokenRef(
+                        line_id=line_id,
+                        token_index=tok.token_index,
+                        text=tok.text,
+                        bbox=tok.bbox,
+                    )
+                )
+    return refs
+
+
+def _attach_token_provenance(extraction: InvoiceExtraction, pages: List[OcrPage]) -> None:
+    """
+    Attach token-level provenance for each numeric field in line items.
+    This makes LLM outputs auditable and enables strict validation.
+    """
+    tokens_by_line = _build_token_index(pages)
+
+    for item in extraction.line_items:
+        item.source_tokens = {}
+        for field_name in ("quantity", "unit_price", "line_total", "discount", "extra_cost"):
+            value = getattr(item, field_name)
+            if value is None:
+                continue
+            refs = _token_refs_for_value(value, item.source_line_ids, tokens_by_line)
+            item.source_tokens[field_name] = refs
+
+
 class OcrToken(BaseModel):
     text: str
     bbox: Tuple[float, float, float, float]
     confidence: float
     line_id: str
     block_id: str
+    token_index: int | None = None
+
+
+class TokenRef(BaseModel):
+    line_id: str
+    token_index: int
+    text: str
+    bbox: Tuple[float, float, float, float]
 
 
 class OcrLine(BaseModel):
@@ -200,6 +278,7 @@ class InvoiceLineItem(BaseModel):
     discount: float | None = None
     extra_cost: float | None = None
     source_line_ids: List[str]
+    source_tokens: Dict[str, List[TokenRef]] | None = None
 
 
 class InvoiceSummary(BaseModel):
@@ -560,6 +639,19 @@ async def _perform_ocr(invoice_id: str) -> List[OcrPage]:
                     lines_map[key], key=lambda t: t.bbox[0]
                 )  # sort left-to-right
 
+                # Assign stable token indices within the line.
+                tokens = [
+                    OcrToken(
+                        text=t.text,
+                        bbox=t.bbox,
+                        confidence=t.confidence,
+                        line_id=t.line_id,
+                        block_id=t.block_id,
+                        token_index=i,
+                    )
+                    for i, t in enumerate(tokens)
+                ]
+
                 # Derive line bbox from token bboxes.
                 x_mins = [t.bbox[0] for t in tokens]
                 y_mins = [t.bbox[1] for t in tokens]
@@ -714,6 +806,9 @@ async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, 
         raw_model_output=parsed,
     )
 
+    # Attach token-level provenance for numeric fields (line items).
+    _attach_token_provenance(extraction, pages)
+
     # Run zero-hallucination validation on top of the extraction.
     ocr_numbers_by_line = _collect_ocr_numbers_by_line(pages)
     extraction.validation = _validate_extraction(invoice_id, extraction, ocr_numbers_by_line)
@@ -759,12 +854,16 @@ def _validate_extraction(
             value = getattr(item, field_name)
             if value is None:
                 continue
-            if not _value_appears_in_ocr(value, item.source_line_ids, ocr_numbers_by_line):
+            refs = (item.source_tokens or {}).get(field_name) or []
+            if not refs:
                 issues.append(
                     ValidationIssue(
                         level="error",
-                        code="value_not_in_ocr",
-                        message=f"{field_name}={value!r} does not appear in OCR text near its source_line_ids",
+                        code="missing_token_provenance",
+                        message=(
+                            f"{field_name}={value!r} could not be linked to OCR tokens "
+                            f"for source_line_ids={item.source_line_ids}"
+                        ),
                         path=f"{path_prefix}.{field_name}",
                     )
                 )
