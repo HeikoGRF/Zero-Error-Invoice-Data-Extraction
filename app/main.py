@@ -166,36 +166,41 @@ def _text_in_ocr_lines(value: str | None, ocr_lines: List[str]) -> bool:
 
 def _extract_vendor_customer_from_ocr(pages: List[OcrPage]) -> Tuple[str | None, str | None]:
     """
-    Deterministic fallback for vendor/customer from OCR layout:
-    - vendor: first meaningful line near top of page 1
+    Layout-based extraction: one OCR line per entity, no string cleanup.
+    - vendor: first line of block 1 (header), or first line before invoice/bill markers
     - customer: first line after a 'Bill To' marker
     """
     if not pages:
         return None, None
 
     page1 = pages[0]
-    lines = [
-        " ".join(token.text for token in line.tokens).strip()
+    lines_with_ids = [
+        (line.id, " ".join(token.text for token in line.tokens).strip())
         for line in sorted(page1.lines, key=lambda l: l.reading_order_index)
     ]
-    lines = [l for l in lines if l]
-    if not lines:
+    lines_with_ids = [(lid, text) for lid, text in lines_with_ids if text]
+    if not lines_with_ids:
         return None, None
 
+    lines = [t for _, t in lines_with_ids]
     vendor: str | None = None
     customer: str | None = None
 
-    # Vendor candidate: first line before invoice/bill markers.
-    stop_words = ("invoice", "bill to", "due date", "purchase order")
-    for line in lines:
-        norm = _normalize_text(line)
-        if any(w in norm for w in stop_words):
-            break
-        if len(norm) >= 3:
-            vendor = line
-            break
+    # Vendor: first line of block 1 (header) if identifiable, else first line before markers.
+    block1_lines = [t for lid, t in lines_with_ids if lid.startswith("p1_b1_")]
+    if block1_lines:
+        vendor = block1_lines[0]
+    else:
+        stop_words = ("invoice", "bill to", "due date", "purchase order")
+        for line in lines:
+            norm = _normalize_text(line)
+            if any(w in norm for w in stop_words):
+                break
+            if len(norm) >= 3:
+                vendor = line
+                break
 
-    # Customer candidate: line right after "Bill To" marker.
+    # Customer: first line after "Bill To" marker.
     bill_idx = None
     for i, line in enumerate(lines):
         if "bill to" in _normalize_text(line):
@@ -208,6 +213,30 @@ def _extract_vendor_customer_from_ocr(pages: List[OcrPage]) -> Tuple[str | None,
                 break
 
     return vendor, customer
+
+
+def _extract_invoice_number_and_date_from_ocr(ocr_lines: List[str]) -> Tuple[str | None, str | None]:
+    """
+    Deterministic extraction for invoice number and invoice date.
+    Prevents confusion with PO number or due date.
+    """
+    invoice_number = None
+    invoice_date = None
+
+    for line in ocr_lines:
+        # Invoice number
+        if invoice_number is None and re.search(r"\binvoice\s*number\b", line, flags=re.IGNORECASE):
+            m = re.search(r"\binvoice\s*number\b[:\s-]*([A-Za-z0-9\-_/]+)", line, flags=re.IGNORECASE)
+            if m:
+                invoice_number = m.group(1).strip()
+
+        # Invoice date (explicitly exclude due date lines)
+        if invoice_date is None and re.search(r"\binvoice\s*date\b", line, flags=re.IGNORECASE):
+            m = re.search(r"\binvoice\s*date\b[:\s-]*([0-9]{4}-[0-9]{2}-[0-9]{2})", line, flags=re.IGNORECASE)
+            if m:
+                invoice_date = m.group(1).strip()
+
+    return invoice_number, invoice_date
 
 
 def _value_appears_in_ocr(
@@ -996,12 +1025,20 @@ async def _run_extraction_pipeline(invoice_id: str) -> Tuple[InvoiceExtraction, 
     )
 
     # Deterministic metadata correction from OCR anchors to reduce LLM drift.
-    ocr_vendor, ocr_customer = _extract_vendor_customer_from_ocr(pages)
     ocr_lines = _collect_ocr_line_texts(pages)
-    if ocr_vendor and not _text_in_ocr_lines(extraction.metadata.vendor_name, ocr_lines):
-        extraction.metadata.vendor_name = ocr_vendor
-    if ocr_customer and not _text_in_ocr_lines(extraction.metadata.customer_name, ocr_lines):
-        extraction.metadata.customer_name = ocr_customer
+    ocr_vendor, ocr_customer = _extract_vendor_customer_from_ocr(pages)
+    ocr_invoice_number, ocr_invoice_date = _extract_invoice_number_and_date_from_ocr(ocr_lines)
+
+    # OCR-anchored metadata overrides LLM values when available.
+    # Layout-based: one OCR line per entity, no string cleanup.
+    if ocr_vendor:
+        extraction.metadata.vendor_name = ocr_vendor.strip() or None
+    if ocr_customer:
+        extraction.metadata.customer_name = ocr_customer.strip() or None
+    if ocr_invoice_number:
+        extraction.metadata.invoice_number = ocr_invoice_number
+    if ocr_invoice_date:
+        extraction.metadata.invoice_date = ocr_invoice_date
 
     # Compute and attach OCR quality metrics.
     extraction.quality = _compute_ocr_quality(pages)
