@@ -31,7 +31,7 @@ Create a local `.env` file (not committed) with:
 
 ```bash
 GEMINI_API_KEY=your-gemini-api-key
-GEMINI_MODEL=gemini-3-flash      # or another Gemini text model
+GEMINI_MODEL=gemini-2.5-flash-lite      # or another Gemini text model
 OCR_PSM=3                        # Tesseract page segmentation mode (3 works well for invoices)
 ```
 
