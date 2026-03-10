@@ -1,0 +1,102 @@
+{
+  "name": "clean_single_page",
+  "ocr_lines": [
+    "ACME Supplies GmbH",
+    "Invoice Number: INV-2025-0042",
+    "Invoice Date: 2025-11-03",
+    "Bill To:",
+    "TalkyLabs AG",
+    "Cloud Hosting Pro Plan 2 250.00 EUR 0.00 EUR 500.00 EUR",
+    "API Usage 150000 calls 1 90.00 EUR 0.00 EUR 90.00 EUR",
+    "Premium Support Monthly 1 120.00 EUR 10.00 EUR 110.00 EUR",
+    "Onboarding Workshop 1 400.00 EUR 0.00 EUR 400.00 EUR",
+    "Subtotal 1100.00 EUR",
+    "Tax Base 1100.00 EUR",
+    "VAT 19% 209.00 EUR",
+    "Total 1309.00 EUR"
+  ],
+  "extraction": {
+    "invoice_id": "fixture-clean",
+    "line_items": [
+      {
+        "description": "Cloud Hosting Pro Plan",
+        "quantity": 2,
+        "unit_price": 250.0,
+        "line_total": 500.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l1"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l1", "token_index": 1, "text": "2", "bbox": [0.1, 0.1, 0.12, 0.12]}],
+          "unit_price": [{"line_id": "p1_b1_l1", "token_index": 2, "text": "250.00", "bbox": [0.13, 0.1, 0.18, 0.12]}],
+          "line_total": [{"line_id": "p1_b1_l1", "token_index": 4, "text": "500.00", "bbox": [0.2, 0.1, 0.25, 0.12]}],
+          "discount": [{"line_id": "p1_b1_l1", "token_index": 3, "text": "0.00", "bbox": [0.18, 0.1, 0.2, 0.12]}]
+        }
+      },
+      {
+        "description": "API Usage 150000 calls",
+        "quantity": 1,
+        "unit_price": 90.0,
+        "line_total": 90.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l2"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l2", "token_index": 1, "text": "1", "bbox": [0.1, 0.13, 0.12, 0.15]}],
+          "unit_price": [{"line_id": "p1_b1_l2", "token_index": 2, "text": "90.00", "bbox": [0.13, 0.13, 0.17, 0.15]}],
+          "line_total": [{"line_id": "p1_b1_l2", "token_index": 4, "text": "90.00", "bbox": [0.19, 0.13, 0.23, 0.15]}],
+          "discount": [{"line_id": "p1_b1_l2", "token_index": 3, "text": "0.00", "bbox": [0.17, 0.13, 0.19, 0.15]}]
+        }
+      },
+      {
+        "description": "Premium Support Monthly",
+        "quantity": 1,
+        "unit_price": 120.0,
+        "line_total": 110.0,
+        "discount": 10.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l3"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l3", "token_index": 1, "text": "1", "bbox": [0.1, 0.16, 0.12, 0.18]}],
+          "unit_price": [{"line_id": "p1_b1_l3", "token_index": 2, "text": "120.00", "bbox": [0.13, 0.16, 0.18, 0.18]}],
+          "line_total": [{"line_id": "p1_b1_l3", "token_index": 4, "text": "110.00", "bbox": [0.2, 0.16, 0.25, 0.18]}],
+          "discount": [{"line_id": "p1_b1_l3", "token_index": 3, "text": "10.00", "bbox": [0.18, 0.16, 0.2, 0.18]}]
+        }
+      },
+      {
+        "description": "Onboarding Workshop",
+        "quantity": 1,
+        "unit_price": 400.0,
+        "line_total": 400.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l4"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l4", "token_index": 1, "text": "1", "bbox": [0.1, 0.19, 0.12, 0.21]}],
+          "unit_price": [{"line_id": "p1_b1_l4", "token_index": 2, "text": "400.00", "bbox": [0.13, 0.19, 0.18, 0.21]}],
+          "line_total": [{"line_id": "p1_b1_l4", "token_index": 4, "text": "400.00", "bbox": [0.2, 0.19, 0.25, 0.21]}],
+          "discount": [{"line_id": "p1_b1_l4", "token_index": 3, "text": "0.00", "bbox": [0.18, 0.19, 0.2, 0.21]}]
+        }
+      }
+    ],
+    "summary": {
+      "subtotal": 1100.0,
+      "total": 1309.0,
+      "currency": "EUR",
+      "tax_bases": [1100.0],
+      "tax_rates": [19.0]
+    },
+    "metadata": {
+      "invoice_number": "INV-2025-0042",
+      "invoice_date": "2025-11-03",
+      "vendor_name": "ACME Supplies GmbH",
+      "customer_name": "TalkyLabs AG"
+    },
+    "raw_model_output": {}
+  },
+  "expect": {
+    "status": "ok",
+    "required_issue_codes": []
+  }
+}
+

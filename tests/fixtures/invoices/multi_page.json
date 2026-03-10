@@ -1,0 +1,87 @@
+{
+  "name": "multi_page",
+  "ocr_lines": [
+    "Globex Corporation",
+    "Invoice Number: INV-2025-1001",
+    "Bill To:",
+    "TalkyLabs AG",
+    "Page 1",
+    "Service A 2 100.00 EUR 0.00 EUR 200.00 EUR",
+    "Service B 1 150.00 EUR 0.00 EUR 150.00 EUR",
+    "Page 2",
+    "Service C 1 300.00 EUR 0.00 EUR 300.00 EUR",
+    "Subtotal 650.00 EUR",
+    "Tax Base 650.00 EUR",
+    "VAT 19% 123.50 EUR",
+    "Total 773.50 EUR"
+  ],
+  "extraction": {
+    "invoice_id": "fixture-multipage",
+    "line_items": [
+      {
+        "description": "Service A",
+        "quantity": 2,
+        "unit_price": 100.0,
+        "line_total": 200.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l1"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l1", "token_index": 1, "text": "2", "bbox": [0.1, 0.1, 0.12, 0.12]}],
+          "unit_price": [{"line_id": "p1_b1_l1", "token_index": 2, "text": "100.00", "bbox": [0.13, 0.1, 0.18, 0.12]}],
+          "line_total": [{"line_id": "p1_b1_l1", "token_index": 4, "text": "200.00", "bbox": [0.2, 0.1, 0.25, 0.12]}],
+          "discount": [{"line_id": "p1_b1_l1", "token_index": 3, "text": "0.00", "bbox": [0.18, 0.1, 0.2, 0.12]}]
+        }
+      },
+      {
+        "description": "Service B",
+        "quantity": 1,
+        "unit_price": 150.0,
+        "line_total": 150.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l2"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l2", "token_index": 1, "text": "1", "bbox": [0.1, 0.13, 0.12, 0.15]}],
+          "unit_price": [{"line_id": "p1_b1_l2", "token_index": 2, "text": "150.00", "bbox": [0.13, 0.13, 0.18, 0.15]}],
+          "line_total": [{"line_id": "p1_b1_l2", "token_index": 4, "text": "150.00", "bbox": [0.2, 0.13, 0.25, 0.15]}],
+          "discount": [{"line_id": "p1_b1_l2", "token_index": 3, "text": "0.00", "bbox": [0.18, 0.13, 0.2, 0.15]}]
+        }
+      },
+      {
+        "description": "Service C",
+        "quantity": 1,
+        "unit_price": 300.0,
+        "line_total": 300.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p2_b1_l1"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p2_b1_l1", "token_index": 1, "text": "1", "bbox": [0.1, 0.1, 0.12, 0.12]}],
+          "unit_price": [{"line_id": "p2_b1_l1", "token_index": 2, "text": "300.00", "bbox": [0.13, 0.1, 0.18, 0.12]}],
+          "line_total": [{"line_id": "p2_b1_l1", "token_index": 4, "text": "300.00", "bbox": [0.2, 0.1, 0.25, 0.12]}],
+          "discount": [{"line_id": "p2_b1_l1", "token_index": 3, "text": "0.00", "bbox": [0.18, 0.1, 0.2, 0.12]}]
+        }
+      }
+    ],
+    "summary": {
+      "subtotal": 650.0,
+      "total": 773.5,
+      "currency": "EUR",
+      "tax_bases": [650.0],
+      "tax_rates": [19.0]
+    },
+    "metadata": {
+      "invoice_number": "INV-2025-1001",
+      "invoice_date": "2025-11-05",
+      "vendor_name": "Globex Corporation",
+      "customer_name": "TalkyLabs AG"
+    },
+    "raw_model_output": {}
+  },
+  "expect": {
+    "status": "ok",
+    "required_issue_codes": []
+  }
+}
+

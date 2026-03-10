@@ -1,0 +1,53 @@
+{
+  "name": "noisy_scan",
+  "ocr_lines": [
+    "ACME Supplles GmbH",
+    "Invoice Number: INV-2025-0042",
+    "Bill To:",
+    "TalkyLabs AG",
+    "Hosting Pro Plan 2 250.00 EUR 0.00 EUR 500.00 EUR",
+    "Subtotal 1100.00 EUR",
+    "Tax Base 1100.00 EUR",
+    "VAT 19% 209.00 EUR",
+    "Total 1309.00 EUR"
+  ],
+  "extraction": {
+    "invoice_id": "fixture-noisy",
+    "line_items": [
+      {
+        "description": "Hosting Pro Plan",
+        "quantity": 2,
+        "unit_price": 250.0,
+        "line_total": 500.0,
+        "discount": 0.0,
+        "extra_cost": null,
+        "source_line_ids": ["p1_b1_l1"],
+        "source_tokens": {
+          "quantity": [{"line_id": "p1_b1_l1", "token_index": 1, "text": "2", "bbox": [0.1, 0.1, 0.12, 0.12]}],
+          "unit_price": [{"line_id": "p1_b1_l1", "token_index": 2, "text": "250.00", "bbox": [0.13, 0.1, 0.18, 0.12]}],
+          "line_total": [{"line_id": "p1_b1_l1", "token_index": 4, "text": "500.00", "bbox": [0.2, 0.1, 0.25, 0.12]}],
+          "discount": [{"line_id": "p1_b1_l1", "token_index": 3, "text": "0.00", "bbox": [0.18, 0.1, 0.2, 0.12]}]
+        }
+      }
+    ],
+    "summary": {
+      "subtotal": 500.0,
+      "total": 595.0,
+      "currency": "EUR",
+      "tax_bases": [500.0],
+      "tax_rates": [19.0]
+    },
+    "metadata": {
+      "invoice_number": "INV-2025-0042",
+      "invoice_date": "2025-11-03",
+      "vendor_name": "ACME Supplles GmbH",
+      "customer_name": "TalkyLabs AG"
+    },
+    "raw_model_output": {}
+  },
+  "expect": {
+    "status": "ok",
+    "required_issue_codes": []
+  }
+}
+

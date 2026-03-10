@@ -7,3 +7,4 @@ Pillow==10.4.0
 pytesseract==0.3.10
 google-generativeai
 python-dotenv==1.0.1
+pytest==8.3.3
